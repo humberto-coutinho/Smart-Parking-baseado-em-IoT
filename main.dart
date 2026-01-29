@@ -93,7 +93,7 @@ class ParkingHomePage extends StatefulWidget {
 }
 
 class _ParkingHomePageState extends State<ParkingHomePage> {
-  //final hostCtrl = TextEditingController(text: '192.168.0.189'); // IP do broker
+  
   final userCtrl = TextEditingController(text: 'Veículo');
   final vehicleCtrl = TextEditingController(text: 'ABC-1234');
   DateTime scheduledAt = DateTime.now().add(const Duration(minutes: 5));
@@ -115,8 +115,8 @@ class _ParkingHomePageState extends State<ParkingHomePage> {
   String vagaSelecionada = 'Vaga 1';
 
   // Localização fixa do estacionamento (troca pelos dados reais)
-  static const double espLat = -21.7702;
-  static const double espLng = -43.3527;
+  static const double espLat = %use your location;
+  static const double espLng = %use your location;
 
   // Raio para considerar "perto do estacionamento"
   static const double detectionRadiusMeters = 20;
@@ -232,11 +232,11 @@ class _ParkingHomePageState extends State<ParkingHomePage> {
 Future<void> connectMQTT() async {
   appendLog('Tentando conectar ao HiveMQ Cloud via WSS...');
 
-  final broker = 'c0c5fc946a1b4ed29793ced61a0f290c.s1.eu.hivemq.cloud';
-  final username = 'spotz_user';
-  final password = 'Humberto01!';
+  final broker = 'use your broker';
+  final username = 'username';
+  final password = 'password';
 
-  client = MqttBrowserClient('wss://$broker/mqtt', 'smart_parking_web');
+  client = MqttBrowserClient('your broker', 'smart_parking_web');
   client.port = 8884;
   client.keepAlivePeriod = 30;
   client.setProtocolV311();
@@ -292,8 +292,8 @@ Future<void> connectMQTT() async {
 
   Future<void> main() async {
     final client = MqttServerClient.withPort(
-      'c0c5fc946a1b4ed29793ced61a0f290c.s1.eu.hivemq.cloud',
-      'spotz_app',
+      'your broker',
+      'id',
       8883,
     );
 
@@ -303,8 +303,8 @@ Future<void> connectMQTT() async {
     client.securityContext = SecurityContext.defaultContext;
 
     final connMessage = MqttConnectMessage()
-        .withClientIdentifier('spotz_app')
-        .authenticateAs('spotz_user', 'Humberto01!')
+        .withClientIdentifier('id')
+        .authenticateAs('username', 'password')
         .startClean()
         .withWillQos(MqttQos.atLeastOnce);
     client.connectionMessage = connMessage;
@@ -477,8 +477,8 @@ Future<void> liberarVaga(String vaga) async {
 // 🛰️ Atualiza posição continuamente e checa proximidade
 void _startLocationUpdates() {
   const double raio = 20.0;
-  const estacionamentoLat = -21.7702;
-  const estacionamentoLng = -43.3527;
+  const estacionamentoLat = %use your location;
+  const estacionamentoLng = %use your location;
 
   Geolocator.getPositionStream(
     locationSettings: const LocationSettings(
