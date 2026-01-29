@@ -1,0 +1,422 @@
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <PubSubClient.h>
+#include <ESP32Servo.h>
+#include <ArduinoJson.h>
+
+
+/* ===================== WIFI ===================== */
+const char* WIFI_SSID = "MDC 2.4 GHZ";
+const char* WIFI_PASS = "humberto";
+
+/* ===================== HIVEMQ CLOUD (TLS) ===================== */
+const char* MQTT_HOST = "c0c5fc946a1b4ed29793ced61a0f290c.s1.eu.hivemq.cloud";
+const int   MQTT_PORT = 8883;
+
+const char* MQTT_USER = "spotz_user";
+const char* MQTT_PASS = "Humberto01!";
+
+/* ===================== TOPICOS ===================== */
+// ESP32 -> app (status)
+const char* TOP_VAGA1_STATUS = "smartparking/vagas/vaga1/status";
+const char* TOP_VAGA2_STATUS = "smartparking/vagas/vaga2/status";
+const char* TOP_SERVO_STATUS = "smartparking/servo/status";
+
+// app -> ESP32 (comando)
+const char* TOP_COMANDO = "smartparking/servo/comando";
+
+
+
+/* ===================== PINOS ===================== */
+const int FSR1 = 34; // Vaga 1
+const int FSR2 = 35; // Vaga 2
+
+const int LED1_VERDE = 26;
+const int LED1_VERM  = 27;
+
+const int LED2_VERDE = 32;
+const int LED2_VERM  = 33;
+
+const int BOTAO_OK   = 25;
+const int SERVO_PIN  = 18;
+
+/* ===================== OBJETOS ===================== */
+WiFiClientSecure net;
+PubSubClient mqtt(net);
+Servo servo;
+
+/* ===================== VARIÁVEIS ===================== */
+int baseline1 = 0, baseline2 = 0;
+int threshold1 = 0, threshold2 = 0;
+
+bool vaga1_ocupada = false;
+bool vaga2_ocupada = false;
+
+bool botao_anterior = HIGH;
+int servo_posicao = 0; // 0 (fechado) ou 180 (aberto)
+
+// Para publicar só quando muda
+bool last_vaga1 = false;
+bool last_vaga2 = false;
+int  last_servo_pos = -1;
+
+bool servoEmMovimento = false;
+
+
+// ===================== SERVO SUAVE =====================
+const int SERVO_FECHADO = 0;
+const int SERVO_ABERTO  = 180;
+
+// Ajuste fino:
+const int SERVO_STEP_DEG = 2;     // tamanho do passo (1 a 5 geralmente)
+const int SERVO_STEP_DELAY = 12;  // ms entre passos (10 a 25 geralmente)
+
+// Se quiser evitar forçar fim de curso, você pode trocar 0/180 por 10/170:
+const int SERVO_MIN_SAFE = 0;     // ex: 10
+const int SERVO_MAX_SAFE = 180;   // ex: 170
+
+// ===== FSR tuning =====
+const int FSR_SAMPLES = 20;           // mais amostras = mais estável
+const int FSR_MARGIN = 30;            // <-- diminua para detectar menos pressão (ex: 40~120)
+const int FSR_HYST = 25;              // histerese (evita ficar oscilando)
+const int BASELINE_LEARN_RATE = 50; // maior = mais lento (bom). Teste 30~100
+
+const int SERVO_HOLD_MS = 700;
+
+// Atualiza estado com histerese
+bool fsrOcupadoComHisterese(int leitura, int threshold, bool estadoAtual) {
+  if (!estadoAtual) {
+    // estava LIVRE -> fica OCUPADO se passar do threshold
+    return leitura >= threshold;
+  } else {
+    // estava OCUPADO -> só volta a LIVRE se cair abaixo de (threshold - HYST)
+    return leitura >= (threshold - FSR_HYST);
+  }
+}
+
+
+void moverServoSuave(int targetPos) {
+  if (!servo.attached()) {
+  servo.attach(SERVO_PIN, 500, 2400);
+  delay(50);
+  servo.write(servo_posicao);
+  delay(50);
+  }
+
+  targetPos = constrain(targetPos, SERVO_MIN_SAFE, SERVO_MAX_SAFE);
+
+  int current = servo_posicao;
+  if (current == targetPos) return;
+
+  int direction = (targetPos > current) ? 1 : -1;
+
+  while (current != targetPos) {
+    current += direction * SERVO_STEP_DEG;
+
+    // não ultrapassar o alvo
+    if ((direction == 1 && current > targetPos) ||
+        (direction == -1 && current < targetPos)) {
+      current = targetPos;
+    }
+
+    servo.write(current);
+    delay(SERVO_STEP_DELAY);
+
+    // mantém MQTT vivo durante movimento (evita desconectar se demorar)
+    mqtt.loop();
+  }
+
+  servo_posicao = targetPos;
+}
+
+
+/* ===================== FUNÇÃO DE LEITURA ESTÁVEL ===================== */
+int leituraFSR(int pin) {
+  long soma = 0;
+  for (int i = 0; i < FSR_SAMPLES; i++) {
+    soma += analogRead(pin);
+    delayMicroseconds(800);
+  }
+  return (int)(soma / FSR_SAMPLES);
+}
+
+/* ===================== PUBLICAÇÕES ===================== */
+void publishVagasIfChanged() {
+  if (vaga1_ocupada != last_vaga1) {
+    mqtt.publish(TOP_VAGA1_STATUS, vaga1_ocupada ? "true" : "false", true);
+    last_vaga1 = vaga1_ocupada;
+  }
+
+  if (vaga2_ocupada != last_vaga2) {
+    mqtt.publish(TOP_VAGA2_STATUS, vaga2_ocupada ? "true" : "false", true);
+    last_vaga2 = vaga2_ocupada;
+  }
+}
+
+void publishServoIfChanged() {
+  if (servo_posicao != last_servo_pos) {
+    mqtt.publish(TOP_SERVO_STATUS, (servo_posicao == 180) ? "aberto" : "fechado", true);
+    last_servo_pos = servo_posicao;
+  }
+}
+
+/* ===================== CONTROLE SERVO (SEGURANÇA) ===================== */
+bool condicaoSeguraParaAbrir() {
+  return true;
+}
+
+
+
+
+// tempo para o servo "assentar" no final (ajuste 300~1000ms)
+
+
+void setServo(int targetPos) {
+  // garante attach antes de mover
+  if (!servo.attached()) {
+    servo.setPeriodHertz(50);
+    servo.attach(SERVO_PIN, 500, 2400);
+    delay(50);
+    servo.write(servo_posicao);
+    delay(50);
+  }
+
+  // move com rampa
+  moverServoSuave(targetPos);
+
+  // publica status
+  publishServoIfChanged();
+
+  // segura um pouco o sinal pra garantir que terminou e não "volta"
+  delay(SERVO_HOLD_MS);
+
+  // agora sim corta consumo
+  servo.detach();
+}
+
+
+
+
+
+void toggleServo() {
+  if (!condicaoSeguraParaAbrir()) {
+    Serial.println("Condicao insegura: servo bloqueado.");
+    publishServoIfChanged();
+    return;
+  }
+
+  if (servo_posicao == 0) setServo(180);
+  else setServo(0);
+}
+
+
+
+
+/* ===================== MQTT CALLBACK ===================== */
+void onMqttMessage(char* topic, byte* payload, unsigned int length) {
+  String msg;
+  for (unsigned int i = 0; i < length; i++) msg += (char)payload[i];
+  msg.trim();
+
+  Serial.print("MQTT <- [");
+  Serial.print(topic);
+  Serial.print("] ");
+  Serial.println(msg);
+
+  if (String(topic) != TOP_COMANDO) return;
+
+  StaticJsonDocument<256> doc;
+  DeserializationError err = deserializeJson(doc, msg);
+
+  // ✅ Só trata como JSON se for objeto e tiver "acao"
+  if (!err && doc.is<JsonObject>() && doc.containsKey("acao")) {
+    const char* acao = doc["acao"] | "";
+    String ac = String(acao); ac.toLowerCase();
+
+    if (ac == "registrar") { setServo(180); return; }
+    if (ac == "retirar")   { setServo(0);   return; }
+    if (ac == "abrir")     { setServo(180); return; }
+    if (ac == "fechar")    { setServo(0);   return; }
+    if (ac == "toggle")    { toggleServo(); return; }
+
+    Serial.println("Ação JSON desconhecida.");
+    return;
+  }
+
+  // ✅ Fallback: texto puro (inclui caso `"toggle"` vindo do site)
+  String plain = msg;
+  plain.replace("\"", "");   // remove aspas se vier como "toggle"
+  plain.trim();
+  plain.toLowerCase();
+
+  if (plain == "abrir") setServo(180);
+  else if (plain == "fechar") setServo(0);
+  else if (plain == "toggle") toggleServo();
+  else if (plain == "registrar") setServo(180);
+  else if (plain == "retirar") setServo(0);
+  else Serial.println("Comando desconhecido (nem JSON com acao, nem texto válido).");
+}
+
+
+
+/* ===================== WIFI + MQTT ===================== */
+void connectWiFi() {
+  Serial.print("Conectando no Wi-Fi: ");
+  Serial.println(WIFI_SSID);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(400);
+    Serial.print(".");
+  }
+
+  Serial.println();
+  Serial.print("Wi-Fi conectado! IP: ");
+  Serial.println(WiFi.localIP());
+}
+
+void connectMQTT() {
+  // TLS sem validar certificado (mais simples). Funciona bem para protótipo.
+  // Em produção, o ideal é setar o CA cert do HiveMQ Cloud.
+  net.setInsecure();
+
+  mqtt.setServer(MQTT_HOST, MQTT_PORT);
+  mqtt.setCallback(onMqttMessage);
+
+  while (!mqtt.connected()) {
+    Serial.print("Conectando ao MQTT (TLS)... ");
+
+    String clientId = "esp32-smartparking-";
+    clientId += String((uint32_t)ESP.getEfuseMac(), HEX);
+
+    bool ok = mqtt.connect(clientId.c_str(), MQTT_USER, MQTT_PASS);
+
+    if (ok) {
+      Serial.println("OK!");
+      mqtt.subscribe(TOP_COMANDO);
+      Serial.print("Subscrito em: ");
+      Serial.println(TOP_COMANDO);
+
+
+      // publica estado inicial (retained)
+      publishVagasIfChanged();
+      publishServoIfChanged();
+
+    } else {
+      Serial.print("Falhou, rc=");
+      Serial.print(mqtt.state());
+      Serial.println(" | tentando de novo em 2s");
+      delay(2000);
+    }
+  }
+}
+
+/* ===================== SETUP ===================== */
+void setup() {
+  Serial.begin(115200);
+  delay(800);
+
+  pinMode(LED1_VERDE, OUTPUT);
+  pinMode(LED1_VERM, OUTPUT);
+  pinMode(LED2_VERDE, OUTPUT);
+  pinMode(LED2_VERM, OUTPUT);
+
+  pinMode(BOTAO_OK, INPUT_PULLUP);
+
+  connectWiFi();
+  connectMQTT();
+
+  /* ===== CALIBRAÇÃO FSRs ===== */
+  Serial.println("Calibrando FSRs (nao pressione)...");
+
+  long s1 = 0, s2 = 0;
+  for (int i = 0; i < 100; i++) {
+    s1 += analogRead(FSR1);
+    s2 += analogRead(FSR2);
+    delay(20);
+  }
+
+  baseline1 = s1 / 100;
+  baseline2 = s2 / 100;
+
+  threshold1 = baseline1 + FSR_MARGIN;
+  threshold2 = baseline2 + FSR_MARGIN;
+
+  Serial.println("Calibracao concluida.");
+
+  servo.setPeriodHertz(50);
+  servo.attach(SERVO_PIN, 500, 2400);
+
+  // força posição inicial “conhecida” com pequena rampa
+  servo_posicao = SERVO_FECHADO;
+  servo.write(servo_posicao);
+  delay(200);
+  }
+
+
+/* ===================== LOOP ===================== */
+void loop() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("Wi-Fi caiu. Reconectando...");
+    connectWiFi();
+  }
+
+  if (!mqtt.connected()) {
+    Serial.println("MQTT caiu. Reconectando...");
+    connectMQTT();
+  }
+  mqtt.loop();
+
+  /* ===== LEITURA DOS SENSORES ===== */
+  int leitura1 = leituraFSR(FSR1);
+  int leitura2 = leituraFSR(FSR2);
+
+  vaga1_ocupada = fsrOcupadoComHisterese(leitura1, threshold1, vaga1_ocupada);
+  vaga2_ocupada = fsrOcupadoComHisterese(leitura2, threshold2, vaga2_ocupada);
+  
+  // Ajuste fino: baseline "aprende" o valor quando está LIVRE
+  
+  if (!vaga1_ocupada) baseline1 = (baseline1 * (BASELINE_LEARN_RATE - 1) + leitura1) / BASELINE_LEARN_RATE;
+  if (!vaga2_ocupada) baseline2 = (baseline2 * (BASELINE_LEARN_RATE - 1) + leitura2) / BASELINE_LEARN_RATE;
+
+  threshold1 = baseline1 + FSR_MARGIN;
+  threshold2 = baseline2 + FSR_MARGIN;
+
+
+  /* ===== LEDs VAGA 1 ===== */
+  digitalWrite(LED1_VERDE, vaga1_ocupada ? LOW : HIGH);
+  digitalWrite(LED1_VERM,  vaga1_ocupada ? HIGH : LOW);
+
+  /* ===== LEDs VAGA 2 ===== */
+  digitalWrite(LED2_VERDE, vaga2_ocupada ? LOW : HIGH);
+  digitalWrite(LED2_VERM,  vaga2_ocupada ? HIGH : LOW);
+
+  /* ===== DEBUG ===== */
+  Serial.print("V1: ");
+  Serial.print(vaga1_ocupada ? "OCUPADA" : "LIVRE");
+  Serial.print(" | V2: ");
+  Serial.println(vaga2_ocupada ? "OCUPADA" : "LIVRE");
+
+  /* ===== PUBLICA (somente se mudou) ===== */
+  publishVagasIfChanged();
+
+  /* ===== BOTÃO (toggle, com segurança) ===== */
+  bool botao_atual = digitalRead(BOTAO_OK);
+
+if (botao_anterior == HIGH && botao_atual == LOW) {
+  Serial.println("Botao pressionado -> publicando comando MQTT");
+
+  mqtt.publish(
+    "smartparking/servo/comando",
+    "toggle",
+    true
+  );
+}
+
+
+  botao_anterior = botao_atual;
+  
+  delay(150); 
+}
