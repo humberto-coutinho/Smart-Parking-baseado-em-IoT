@@ -6,15 +6,15 @@
 
 
 /* ===================== WIFI ===================== */
-const char* WIFI_SSID = "MDC 2.4 GHZ";
-const char* WIFI_PASS = "humberto";
+const char* WIFI_SSID = "your wifi";
+const char* WIFI_PASS = "password";
 
 /* ===================== HIVEMQ CLOUD (TLS) ===================== */
-const char* MQTT_HOST = "c0c5fc946a1b4ed29793ced61a0f290c.s1.eu.hivemq.cloud";
+const char* MQTT_HOST = "broker";
 const int   MQTT_PORT = 8883;
 
-const char* MQTT_USER = "spotz_user";
-const char* MQTT_PASS = "Humberto01!";
+const char* MQTT_USER = "username";
+const char* MQTT_PASS = "password";
 
 /* ===================== TOPICOS ===================== */
 // ESP32 -> app (status)
